@@ -48,117 +48,11 @@ pytest test_lilac_preprocessing.py -v -s
 
 ---
 
-## Eval Protocol Utilities Used
-
-This example showcases several Eval Protocol utilities that you can use in your own workflows:
-
-### 1. Trace Adapters - Pull Data from Observability Platforms
-
-```python
-from eval_protocol import create_langfuse_adapter
-
-# Create adapter for your platform
-adapter = create_langfuse_adapter()
-
-# Pull traces and convert to EvaluationRows
-rows = adapter.get_evaluation_rows(
-    limit=100,              # How many traces
-    hours_back=168,         # Time window (7 days)
-    include_tool_calls=True # Include function calls
-)
-```
-
-**Supported platforms:**
-- `create_langfuse_adapter()` - Langfuse
-- `create_langsmith_adapter()` - LangSmith  
-- `create_braintrust_adapter()` - Braintrust
-- `create_fireworks_tracing_adapter()` - Fireworks Tracing
-
-### 2. DataFrame Conversion - Bridge Between EvaluationRows and Pandas
-
-```python
-from eval_protocol.adapters.lilac import (
-    evaluation_rows_to_dataframe,
-    dataframe_to_evaluation_rows,
-)
-
-# Convert EvaluationRows → DataFrame (for Lilac/pandas processing)
-df = evaluation_rows_to_dataframe(rows)
-
-# ... do clustering, filtering, transformations with pandas/Lilac ...
-
-# Convert DataFrame → EvaluationRows (back to eval-protocol format)
-filtered_rows = dataframe_to_evaluation_rows(df)
-```
-
-### 3. DynamicDataLoader - Flexible Data Loading with Preprocessing
-
-```python
-from eval_protocol import DynamicDataLoader
-
-data_loader = DynamicDataLoader(
-    generators=[my_data_generator],     # Functions that return EvaluationRows
-    preprocess_fn=my_preprocess_fn,     # Transform rows before evaluation
-)
-```
-
-The `preprocess_fn` receives ALL rows and returns a filtered/transformed list:
-
-```python
-def my_preprocess_fn(rows: List[EvaluationRow]) -> List[EvaluationRow]:
-    # Filter, sample, cluster, dedupe, etc.
-    return filtered_rows
-```
-
-### 4. EvaluationRow - The Core Data Structure
-
-```python
-from eval_protocol import EvaluationRow, EvaluateResult, MetricResult
-
-# Access conversation data
-row.input_metadata.messages    # The conversation messages
-row.last_assistant_message()   # Get the model's response
-row.last_user_message()        # Get the user's query
-
-# Set evaluation results
-row.evaluation_result = EvaluateResult(
-    score=1.0,
-    is_score_valid=True,
-    reason="Response was helpful",
-    metrics={
-        "relevance": MetricResult(score=0.9, is_score_valid=True, reason="..."),
-        "accuracy": MetricResult(score=1.0, is_score_valid=True, reason="..."),
-    }
-)
-```
-
-### 5. @evaluation_test - The Test Framework
-
-```python
-from eval_protocol import evaluation_test, SingleTurnRolloutProcessor
-
-@evaluation_test(
-    data_loaders=DynamicDataLoader(...),
-    rollout_processor=SingleTurnRolloutProcessor(),  # Handles model calls
-    completion_params=[{
-        "model": "fireworks_ai/accounts/fireworks/models/deepseek-v3p2",
-        "temperature": 0.0,
-    }],
-    mode="pointwise",
-    max_concurrent_rollouts=10,
-)
-def test_my_evaluation(row: EvaluationRow) -> EvaluationRow:
-    # Your evaluation logic here
-    return evaluate(row)
-```
-
----
-
-## How Lilac Preprocessing Works
+## How Lilac Integration Works
 
 ### The Integration Point
 
-The key is the `preprocess_fn` parameter in `DynamicDataLoader`:
+The key is the `preprocess_fn` parameter in `DynamicDataLoader`. This function receives ALL loaded rows and returns a filtered/transformed subset:
 
 ```python
 @evaluation_test(
@@ -168,6 +62,8 @@ The key is the `preprocess_fn` parameter in `DynamicDataLoader`:
     ),
     ...
 )
+def test_my_evaluation(row: EvaluationRow) -> EvaluationRow:
+    return evaluate(row)
 ```
 
 ### The Preprocessing Pipeline
@@ -183,7 +79,7 @@ def lilac_cluster_and_sample(rows: List[EvaluationRow]) -> List[EvaluationRow]:
     """
     import lilac as ll
     
-    # Step 1: Convert to DataFrame
+    # Step 1: Convert to DataFrame using eval-protocol utility
     df = evaluation_rows_to_dataframe(rows)
     df["user_query"] = df["messages_json"].apply(extract_first_user_message)
     
@@ -195,18 +91,18 @@ def lilac_cluster_and_sample(rows: List[EvaluationRow]) -> List[EvaluationRow]:
     )
     dataset = ll.create_dataset(config)
     
-    # Step 3: Cluster
+    # Step 3: Cluster (Lilac handles embedding + UMAP + HDBSCAN)
     dataset.cluster("user_query")
     
-    # Step 4: Sample diverse examples
+    # Step 4: Sample diverse examples from each cluster
     df = dataset.to_pandas(include_signals=True)
-    # ... sampling logic ...
+    # ... sampling logic per cluster ...
     
-    # Step 5: Convert back
+    # Step 5: Convert back using eval-protocol utility
     return dataframe_to_evaluation_rows(df)
 ```
 
-### Clustering Pipeline
+### Clustering Pipeline (What Lilac Does)
 
 ```
 ┌─────────────┐     ┌──────────────┐     ┌─────────────┐     ┌──────────────┐
@@ -221,19 +117,13 @@ def lilac_cluster_and_sample(rows: List[EvaluationRow]) -> List[EvaluationRow]:
 └─────────────┘     └──────────────┘     └─────────────────────────────────┘
 ```
 
----
+1. **Embeds** each user query using sentence transformers (`jina-embeddings-v2-small-en`)
+2. **Reduces dimensions** with UMAP (512 → 5 dimensions)
+3. **Clusters** with HDBSCAN (automatically determines cluster count)
+4. **Names clusters** using an LLM (optional, requires `API_MODEL` env var)
+5. **Samples** N examples from each cluster for diversity
 
-## Configuration
-
-Edit these constants in `test_lilac_preprocessing.py`:
-
-```python
-SAMPLES_PER_CLUSTER = 2   # How many samples from each cluster
-MAX_TOTAL_SAMPLES = 30    # Cap on total output rows
-LANGFUSE_LIMIT = 100      # How many traces to pull from Langfuse
-```
-
-## Example Output
+### Example Output
 
 ```
 ============================================================
@@ -261,6 +151,74 @@ LANGFUSE_LIMIT = 100      # How many traces to pull from Langfuse
 
 ---
 
+## Eval Protocol Utilities Used
+
+This example uses several Eval Protocol utilities that enable the Lilac integration:
+
+### 1. DataFrame Conversion - Bridge Between EvaluationRows and Pandas
+
+```python
+from eval_protocol.adapters.lilac import (
+    evaluation_rows_to_dataframe,
+    dataframe_to_evaluation_rows,
+)
+
+# Convert EvaluationRows → DataFrame (for Lilac/pandas processing)
+df = evaluation_rows_to_dataframe(rows)
+
+# ... do clustering, filtering, transformations with pandas/Lilac ...
+
+# Convert DataFrame → EvaluationRows (back to eval-protocol format)
+filtered_rows = dataframe_to_evaluation_rows(df)
+```
+
+### 2. Trace Adapters - Pull Data from Observability Platforms
+
+```python
+from eval_protocol import create_langfuse_adapter
+
+# Create adapter for your platform
+adapter = create_langfuse_adapter()
+
+# Pull traces and convert to EvaluationRows
+rows = adapter.get_evaluation_rows(
+    limit=100,              # How many traces
+    hours_back=168,         # Time window (7 days)
+    include_tool_calls=True # Include function calls
+)
+```
+
+**Supported platforms:**
+- `create_langfuse_adapter()` - Langfuse
+- `create_langsmith_adapter()` - LangSmith  
+- `create_braintrust_adapter()` - Braintrust
+- `create_fireworks_tracing_adapter()` - Fireworks Tracing
+
+### 3. DynamicDataLoader - Flexible Data Loading with Preprocessing
+
+```python
+from eval_protocol import DynamicDataLoader
+
+data_loader = DynamicDataLoader(
+    generators=[my_data_generator],     # Functions that return EvaluationRows
+    preprocess_fn=my_preprocess_fn,     # Transform rows before evaluation
+)
+```
+
+---
+
+## Configuration
+
+Edit these constants in `test_lilac_preprocessing.py`:
+
+```python
+SAMPLES_PER_CLUSTER = 2   # How many samples from each cluster
+MAX_TOTAL_SAMPLES = 30    # Cap on total output rows
+LANGFUSE_LIMIT = 100      # How many traces to pull from Langfuse
+```
+
+---
+
 ## Bring Your Own Data
 
 ### From Different Trace Sources
@@ -280,7 +238,7 @@ def load_from_file():
         return [EvaluationRow.from_dict(json.loads(line)) for line in f]
 ```
 
-### Custom Preprocessing
+### Custom Preprocessing (Without Lilac)
 
 You can write any preprocessing logic:
 
