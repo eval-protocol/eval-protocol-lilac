@@ -1,0 +1,35 @@
+# Lilac + Eval Protocol
+# 
+# RECOMMENDED: Use the setup script instead:
+#   ./setup.sh
+#
+# Or install manually with pip install -r requirements.txt
+# Note: Some dependency warnings are expected but can be ignored.
+
+# Core
+eval-protocol[langfuse]
+
+# Lilac and dependencies
+lilac
+pandas
+duckdb
+pyarrow
+datasets
+modal
+cloudpickle
+orjson
+pillow
+tenacity
+itsdangerous
+instructor
+loky
+authlib
+
+# Clustering
+umap-learn
+hdbscan
+hnswlib
+sentence-transformers
+
+# Utilities
+python-dotenv
