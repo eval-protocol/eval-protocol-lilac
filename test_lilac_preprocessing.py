@@ -49,7 +49,7 @@ from eval_protocol import (
     create_langfuse_adapter,
     evaluation_test,
 )
-from eval_protocol.adapters.lilac import (
+from eval_protocol.adapters.dataframe import (
     dataframe_to_evaluation_rows,
     evaluation_rows_to_dataframe,
 )
@@ -90,10 +90,11 @@ def langfuse_traces_generator():
 # =============================================================================
 
 
-def extract_first_user_message(messages_json: str) -> str:
-    """Extract the first user message from a conversation for clustering."""
+def extract_first_user_message(data_json: str) -> str:
+    """Extract the first user message from a serialized EvaluationRow for clustering."""
     try:
-        messages = json.loads(messages_json)
+        data = json.loads(data_json)
+        messages = data.get("messages", [])
         for msg in messages:
             if msg.get("role") == "user":
                 content = msg.get("content", "")
@@ -150,7 +151,7 @@ def lilac_cluster_and_sample(rows: List[EvaluationRow]) -> List[EvaluationRow]:
     
     # Convert EvaluationRows to DataFrame
     df = evaluation_rows_to_dataframe(rows)
-    df["user_query"] = df["messages_json"].apply(extract_first_user_message)
+    df["user_query"] = df["data_json"].apply(extract_first_user_message)
     
     # Clean up any existing dataset
     try:
