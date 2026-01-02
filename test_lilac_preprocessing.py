@@ -5,7 +5,7 @@ This test demonstrates using Lilac to:
 1. Pull production traces from Langfuse
 2. Cluster them semantically using HDBSCAN
 3. Sample diverse examples from each cluster
-4. Evaluate the representative subset
+4. Evaluate the representative subset using LLM-as-judge
 
 Run with:
     pytest test_lilac_preprocessing.py -v -s
@@ -23,6 +23,9 @@ Environment variables:
     - OPENAI_API_KEY (or use FIREWORKS_API_KEY with OPENAI_API_BASE)
     - API_MODEL (e.g., 'gpt-4o-mini')
     - OPENAI_API_BASE (for non-OpenAI providers)
+    
+    Optional (for LLM judge):
+    - JUDGE_MODEL (default: fireworks_ai/accounts/fireworks/models/llama-v3p1-70b-instruct)
 """
 
 import json
@@ -232,90 +235,162 @@ def lilac_cluster_and_sample(rows: List[EvaluationRow]) -> List[EvaluationRow]:
     print(f"   Strategy: {SAMPLES_PER_CLUSTER} per cluster, max {MAX_TOTAL_SAMPLES} total")
     print(f"{'='*60}\n")
     
-    # Cleanup
-    try:
-        ll.get_dataset("local", "langfuse_traces_temp").delete()
-    except Exception:
-        pass
+    # NOTE: Dataset is kept for visualization in Lilac UI
+    # Run: lilac start ~/lilac_eval_project --port 5433
+    # Then open http://localhost:5433 to explore clusters
     
     return result_rows
 
 
 # =============================================================================
-# Evaluation Function
+# Evaluation Function - LLM as Judge
 # =============================================================================
 
+# Judge model configuration
+JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "fireworks_ai/accounts/fireworks/models/deepseek-v3p2")
 
-def evaluate_response_quality(row: EvaluationRow) -> EvaluationRow:
+JUDGE_PROMPT = """You are evaluating the quality of an AI assistant's response to a user query.
+
+## User Query
+{user_query}
+
+## Assistant Response
+{assistant_response}
+
+## Evaluation Criteria
+Rate the response on a scale of 1-5:
+- 5: Excellent - Fully addresses the query, accurate, helpful, well-structured
+- 4: Good - Addresses the query well with minor issues
+- 3: Acceptable - Partially addresses the query, some gaps
+- 2: Poor - Misses key aspects, unhelpful, or confusing
+- 1: Very Poor - Completely off-topic, incorrect, or harmful
+
+## Your Response
+Respond in this exact format:
+SCORE: [1-5]
+REASON: [One sentence explaining your score]
+"""
+
+
+def llm_judge_evaluate(row: EvaluationRow) -> EvaluationRow:
     """
-    Evaluate response quality.
+    Use an LLM to judge the quality of the assistant's response.
     
-    Checks if the model responded with either:
-    - Text content (regular response)
-    - Tool calls (function calling)
-    
-    Customize this for your evaluation criteria!
+    This evaluator:
+    1. Extracts the user query and assistant response from the trace
+    2. Asks a judge LLM to rate the response quality (1-5)
+    3. Returns the score and reasoning
     """
+    import litellm
+    
+    # Get user query (last user message)
+    user_messages = row.get_user_messages()
+    user_msg = user_messages[-1] if user_messages else None
+    user_query = ""
+    if user_msg:
+        content = user_msg.content or ""
+        if isinstance(content, list):
+            user_query = " ".join(
+                p.get("text", "") if isinstance(p, dict) else str(p)
+                for p in content
+            )
+        else:
+            user_query = content
+    
+    # Get assistant response
     assistant_msg = row.last_assistant_message()
+    assistant_response = ""
+    if assistant_msg:
+        content = assistant_msg.content or ""
+        if isinstance(content, list):
+            assistant_response = " ".join(
+                p.get("text", "") if isinstance(p, dict) else str(p)
+                for p in content
+            )
+        else:
+            assistant_response = content
+        
+        # Include tool calls if any
+        if assistant_msg.tool_calls:
+            tool_calls_str = "\n".join(
+                f"- Called tool: {tc.function.name}({tc.function.arguments})"
+                for tc in assistant_msg.tool_calls
+            )
+            assistant_response += f"\n\n[Tool Calls]\n{tool_calls_str}"
     
-    if not assistant_msg:
+    # Handle missing data
+    if not user_query:
         row.evaluation_result = EvaluateResult(
             score=0.0,
             is_score_valid=False,
-            reason="No assistant response",
+            reason="No user query found in trace",
             metrics={},
         )
         return row
     
-    # Check for tool calls (valid response type)
-    has_tool_calls = bool(assistant_msg.tool_calls)
-    num_tool_calls = len(assistant_msg.tool_calls) if assistant_msg.tool_calls else 0
-    
-    # Check for text content
-    content = assistant_msg.content or ""
-    if isinstance(content, list):
-        content = " ".join(
-            p.get("text", "") if isinstance(p, dict) else str(p)
-            for p in content
+    if not assistant_response:
+        row.evaluation_result = EvaluateResult(
+            score=0.0,
+            is_score_valid=False,
+            reason="No assistant response found in trace",
+            metrics={},
         )
-    has_content = len(content.strip()) > 10
-    content_length = len(content)
+        return row
     
-    # Valid response = has content OR made tool calls
-    has_valid_response = has_content or has_tool_calls
-    
-    # Build reason string
-    if has_tool_calls and has_content:
-        reason = f"Content ({content_length} chars) + {num_tool_calls} tool call(s)"
-    elif has_tool_calls:
-        reason = f"Made {num_tool_calls} tool call(s)"
-    elif has_content:
-        reason = f"Content: {content_length} chars"
-    else:
-        reason = "No content or tool calls"
-    
-    row.evaluation_result = EvaluateResult(
-        score=1.0 if has_valid_response else 0.0,
-        is_score_valid=True,
-        reason=reason,
-        metrics={
-            "has_content": MetricResult(
-                score=1.0 if has_content else 0.0,
-                is_score_valid=True,
-                reason=f"Length: {content_length}",
-            ),
-            "has_tool_calls": MetricResult(
-                score=1.0 if has_tool_calls else 0.0,
-                is_score_valid=True,
-                reason=f"{num_tool_calls} tool call(s)" if has_tool_calls else "No tool calls",
-            ),
-            "valid_response": MetricResult(
-                score=1.0 if has_valid_response else 0.0,
-                is_score_valid=True,
-                reason=reason,
-            ),
-        },
-    )
+    # Call judge LLM
+    try:
+        judge_response = litellm.completion(
+            model=JUDGE_MODEL,
+            messages=[{
+                "role": "user",
+                "content": JUDGE_PROMPT.format(
+                    user_query=user_query[:2000],  # Truncate if too long
+                    assistant_response=assistant_response[:2000],
+                )
+            }],
+            temperature=0.0,
+            max_tokens=200,
+        )
+        
+        judge_text = judge_response.choices[0].message.content or ""
+        
+        # Parse score and reason
+        score = 3.0  # Default
+        reason = "Could not parse judge response"
+        
+        for line in judge_text.strip().split("\n"):
+            if line.startswith("SCORE:"):
+                try:
+                    score = float(line.replace("SCORE:", "").strip())
+                    score = max(1.0, min(5.0, score))  # Clamp to 1-5
+                except ValueError:
+                    pass
+            elif line.startswith("REASON:"):
+                reason = line.replace("REASON:", "").strip()
+        
+        # Normalize score to 0-1 range
+        normalized_score = (score - 1) / 4.0
+        
+        row.evaluation_result = EvaluateResult(
+            score=normalized_score,
+            is_score_valid=True,
+            reason=f"[{score}/5] {reason}",
+            metrics={
+                "quality": MetricResult(
+                    score=normalized_score,
+                    is_score_valid=True,
+                    reason=f"LLM judge score: {score}/5",
+                ),
+            },
+        )
+        
+    except Exception as e:
+        row.evaluation_result = EvaluateResult(
+            score=0.0,
+            is_score_valid=False,
+            reason=f"Judge LLM error: {str(e)[:100]}",
+            metrics={},
+        )
     
     return row
 
@@ -345,13 +420,13 @@ def evaluate_response_quality(row: EvaluationRow) -> EvaluationRow:
 )
 def test_diverse_langfuse_traces(row: EvaluationRow) -> EvaluationRow:
     """
-    Evaluate a diverse sample of Langfuse traces.
+    Evaluate a diverse sample of Langfuse traces using LLM-as-judge.
     
     This test:
     1. Pulls traces from Langfuse (via langfuse_traces_generator)
     2. Clusters and samples with Lilac (via preprocess_fn)
     3. Runs each through the model (via rollout_processor)
-    4. Evaluates response quality (this function)
+    4. Uses an LLM judge to evaluate response quality (this function)
     """
-    return evaluate_response_quality(row)
+    return llm_judge_evaluate(row)
 
